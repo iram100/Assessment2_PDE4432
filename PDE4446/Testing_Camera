@@ -1,0 +1,80 @@
+"""
+Testing_Camera.py
+- Press 'c' to capture a frame to disk (saved as capture_<timestamp>.jpg).
+- Press 'q' to quit.
+"""
+
+import cv2
+import time
+import sys
+import os
+from datetime import datetime
+
+CAM_INDEX = 1           
+FRAME_WIDTH = 640        
+FRAME_HEIGHT = 480
+WINDOW_NAME = "Camera Testing - Press 'c' to capture, 'q' to quit"
+# ----------------------------
+
+def open_camera(index, w=None, h=None):
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if os.name == "nt" else 0)
+    if not cap.isOpened():
+        return None
+    if w is not None:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+    if h is not None:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+    return cap
+
+def main():
+    cap = open_camera(CAM_INDEX, FRAME_WIDTH, FRAME_HEIGHT)
+    if cap is None or not cap.isOpened():
+        print(f"[ERROR] Could not open camera index {CAM_INDEX}.")
+        sys.exit(1)
+
+    time.sleep(0.2)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+
+    print(f"[INFO] Camera opened (index={CAM_INDEX}). Requested size={FRAME_WIDTH}x{FRAME_HEIGHT}")
+    print(f"[INFO] Camera reports size={actual_w}x{actual_h}, FPS={fps:.2f}")
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[WARN] Frame not received. Trying again...")
+            time.sleep(0.1)
+            continue
+
+        # mirror feed for a more natural webcam view
+        display = cv2.flip(frame, 1)
+
+        # Draw a center crosshair for later use
+        h, w = display.shape[:2]
+        cx, cy = w // 2, h // 2
+        cv2.line(display, (cx-10, cy), (cx+10, cy), (255,255,255), 1)
+        cv2.line(display, (cx, cy-10), (cx, cy+10), (255,255,255), 1)
+
+        cv2.putText(display, f"{w}x{h} | FPS:{fps:.1f}", (8, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+
+        cv2.imshow(WINDOW_NAME, display)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('c'):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"capture_{ts}.jpg"
+            cv2.imwrite(filename, frame)
+            print(f"[INFO] Saved capture to {filename}")
+        elif key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print("[INFO] Camera closed. Bye.")
+
+if __name__ == "__main__":
+    main()
