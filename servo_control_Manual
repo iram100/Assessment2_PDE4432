@@ -1,0 +1,140 @@
+"""
+servo_manual_control.py
+Simple manual pan/tilt controller to test Arduino serial.
+
+- Sends: "<pan> <tilt>\n" where pan, tilt are floats in [-1.0, 1.0]
+- Uses keyboard to adjust pan/tilt:
+    J / L : pan left / right
+    I / K : tilt up / down
+    H     : go to home (0, 0)
+    R     : resend current values
+    Q or ESC : quit
+
+- Shows current pan/tilt and a marker on the camera image.
+
+Set SERIAL_PORT and BAUD_RATE to match your Arduino sketch.
+"""
+
+import cv2
+import serial
+import time
+
+# ---------- USER CONFIG (edit here) ----------
+SERIAL_PORT = "COM3"      
+BAUD_RATE   = 9600      
+CAM_INDEX   = 1 
+STEP_SIZE   = 0.1          # how much to change per key press
+# --------------------------------------------
+
+# internal state for pan/tilt
+pan_value  = 0.0
+tilt_value = 0.0
+
+def clamp(v: float, low: float = -1.0, high: float = 1.0) -> float:
+    return max(low, min(high, v))
+
+def open_serial(port: str, baud: int):
+    try:
+        s = serial.Serial(port, baud, timeout=0.05)
+        time.sleep(2.0)  # let Arduino reset
+        print(f"[INFO] Serial opened on {port} @ {baud}")
+        return s
+    except Exception as e:
+        print(f"[WARN] Could not open serial on {port}: {e}")
+        return None
+
+def send_command(ser, pan: float, tilt: float):
+    """Send one command line to Arduino in the format '<pan> <tilt>\\n'."""
+    pan_c  = clamp(pan)
+    tilt_c = clamp(tilt)
+    message = f"{pan_c:.3f} {tilt_c:.3f}\n"
+
+    if ser is not None and ser.is_open:
+        try:
+            ser.write(message.encode("utf-8"))
+            # optional: read one quick reply line if Arduino prints feedback
+            time.sleep(0.01)
+            if ser.in_waiting:
+                reply = ser.readline().decode(errors="ignore").strip()
+                if reply:
+                    print(f"[ARDUINO] {reply}")
+        except Exception as e:
+            print(f"[ERROR] serial write failed: {e}")
+    print(f"[SEND] pan={pan_c:.3f}, tilt={tilt_c:.3f}, raw='{message.strip()}'")
+
+def main():
+    global pan_value, tilt_value
+
+    ser = open_serial(SERIAL_PORT, BAUD_RATE)
+
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        print("[ERROR] Could not open camera.")
+        return
+
+    print("Manual pan/tilt control:")
+    print("  J/L : pan left/right")
+    print("  I/K : tilt up/down")
+    print("  H   : home (0,0)")
+    print("  R   : resend current values")
+    print("  Q or ESC : quit")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[WARN] no frame; breaking.")
+            break
+
+        frame = cv2.flip(frame, 1)  # mirror view for convenience
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        # marker position based on pan/tilt in [-1,1]
+        marker_x = int(cx + pan_value * cx)
+        marker_y = int(cy - tilt_value * cy)  # minus so positive tilt is up on screen
+
+        # draw centre and marker
+        cv2.circle(frame, (cx, cy), 6, (255, 255, 255), 2)
+        cv2.drawMarker(frame, (marker_x, marker_y), (0, 0, 255),
+                       markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+
+        # overlay text
+        cv2.putText(frame, f"pan={pan_value:+.2f} (J/L)", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+        cv2.putText(frame, f"tilt={tilt_value:+.2f} (I/K)", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+        cv2.imshow("Servo Manual Control", frame)
+
+        key = cv2.waitKey(50) & 0xFF
+        send_now = False
+
+        if key in (ord('q'), 27):   # q or ESC
+            break
+        elif key == ord('j'):
+            pan_value = clamp(pan_value - STEP_SIZE); send_now = True
+        elif key == ord('l'):
+            pan_value = clamp(pan_value + STEP_SIZE); send_now = True
+        elif key == ord('i'):
+            tilt_value = clamp(tilt_value + STEP_SIZE); send_now = True
+        elif key == ord('k'):
+            tilt_value = clamp(tilt_value - STEP_SIZE); send_now = True
+        elif key == ord('h'):
+            pan_value, tilt_value = 0.0, 0.0; send_now = True
+        elif key == ord('r'):
+            send_now = True   # resend current values
+
+        if send_now:
+            send_command(ser, pan_value, tilt_value)
+
+    # on exit, go home and clean up
+    print("[INFO] Exiting, sending home (0,0)")
+    send_command(ser, 0.0, 0.0)
+    cap.release()
+    cv2.destroyAllWindows()
+    if ser is not None and ser.is_open:
+        ser.close()
+        print("[INFO] Serial closed.")
+
+if __name__ == "__main__":
+    main()

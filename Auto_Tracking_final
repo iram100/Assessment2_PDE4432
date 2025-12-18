@@ -1,0 +1,221 @@
+import cv2
+import serial
+import time
+import numpy as np
+
+from Eye_color_tracking import detect_eyes_and_colour
+
+# ============================================================
+# CONFIG
+# ============================================================
+CAM_INDEX = 1
+SERIAL_PORT = "COM3"
+BAUD_RATE = 9600
+
+PAN_SIGN  = +1.0
+TILT_SIGN = -1.0
+
+P_GAIN = 0.0025
+D_GAIN = 0.0005
+
+MAX_STEP = 0.005
+SEND_INTERVAL = 0.10
+
+DEADBAND_X = 40
+DEADBAND_Y = 50
+
+OPEN_KERNEL  = (5,5)
+CLOSE_KERNEL = (13,13)
+CLOSE_ITER   = 4
+
+AREA_MIN = 900
+AREA_MAX_RATIO = 0.25
+# ============================================================
+
+
+HSV_PROFILES = {
+    "red": [
+        (np.array([0,120,60]),  np.array([10,255,255])),
+        (np.array([170,120,60]),np.array([180,255,255]))
+    ],
+    "green": [(np.array([35,70,50]), np.array([85,255,255]))],
+    "blue":  [(np.array([90,80,50]), np.array([130,255,255]))],
+    "yellow":[(np.array([20,100,100]),np.array([35,255,255]))]
+}
+
+
+def clamp(v, lo=-1.0, hi=1.0):
+    return max(lo, min(hi, v))
+
+
+def build_colour_mask(hsv, colour):
+    mask = None
+    for low, high in HSV_PROFILES[colour]:
+        part = cv2.inRange(hsv, low, high)
+        mask = part if mask is None else cv2.bitwise_or(mask, part)
+    return mask
+
+
+def select_best_contour(contours, frame_area):
+    best, best_score = None, -1
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < AREA_MIN or area/frame_area > AREA_MAX_RATIO:
+            continue
+        peri = cv2.arcLength(c, True)
+        if peri == 0:
+            continue
+        circ = 4*np.pi*area/(peri*peri)
+        score = area * circ
+        if score > best_score:
+            best_score = score
+            best = c
+    return best
+
+
+def open_serial():
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.05)
+        time.sleep(2)
+        print("[INFO] Serial connected")
+        return ser
+    except:
+        return None
+
+
+def send_serial(ser, pan, tilt):
+    if ser and ser.is_open:
+        ser.write(f"{pan:.3f} {tilt:.3f}\n".encode())
+
+
+def create_kalman():
+    kf = cv2.KalmanFilter(4, 2)
+    kf.transitionMatrix = np.array(
+        [[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32
+    )
+    kf.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+    kf.errorCovPost = np.eye(4, dtype=np.float32)
+    return kf
+
+
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX)
+    ser = open_serial()
+
+    kernel_o = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, OPEN_KERNEL)
+    kernel_c = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, CLOSE_KERNEL)
+
+    pan_state = tilt_state = 0.0
+    prev_err_x = prev_err_y = 0.0
+
+    kf = create_kalman()
+    kalman_ready = False
+
+    sending = False
+    last_send = 0.0
+    current_colour = "red"
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame = cv2.flip(frame, 1)
+
+        # ---------- EYE DETECTION (NEW, SAFE) ----------
+        eye_colour, frame = detect_eyes_and_colour(frame)
+        if eye_colour:
+            cv2.putText(frame, f"Eye colour: {eye_colour}",
+                        (10,60), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (255,0,255), 2)
+        # ----------------------------------------------
+
+        h, w = frame.shape[:2]
+        cx_f, cy_f = w//2, h//2
+
+        hsv = cv2.cvtColor(cv2.GaussianBlur(frame,(7,7),0), cv2.COLOR_BGR2HSV)
+        mask = build_colour_mask(hsv, current_colour)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_o, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_c, iterations=CLOSE_ITER)
+
+        contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        target = select_best_contour(contours, w*h)
+
+        cx = cy = None
+
+        if target is not None:
+            cv2.drawContours(frame, [target], -1, (0,255,0), 2)
+            M = cv2.moments(target)
+            if M["m00"] != 0:
+                mx = int(M["m10"]/M["m00"])
+                my = int(M["m01"]/M["m00"])
+                meas = np.array([[np.float32(mx)], [np.float32(my)]])
+
+                if not kalman_ready:
+                    kf.statePost = np.array([[mx],[my],[0],[0]], np.float32)
+                    kalman_ready = True
+                else:
+                    kf.correct(meas)
+
+                pred = kf.predict()
+                cx, cy = int(pred[0]), int(pred[1])
+                cv2.circle(frame, (cx,cy), 3, (0,0,255), -1)
+        else:
+            kalman_ready = False
+
+        cv2.drawMarker(frame, (cx_f,cy_f), (255,255,255),
+                       cv2.MARKER_CROSS, 20, 2)
+
+        if sending and cx is not None:
+            err_x = cx - cx_f
+            err_y = cy - cy_f
+
+            if abs(err_x) < DEADBAND_X: err_x = 0
+            if abs(err_y) < DEADBAND_Y: err_y = 0
+
+            pan_vel  = PAN_SIGN  * (P_GAIN*err_x + D_GAIN*(err_x-prev_err_x))
+            tilt_vel = TILT_SIGN * (P_GAIN*err_y + D_GAIN*(err_y-prev_err_y))
+
+            prev_err_x, prev_err_y = err_x, err_y
+
+            pan_state  = clamp(pan_state  + clamp(pan_vel, -MAX_STEP, MAX_STEP))
+            tilt_state = clamp(tilt_state + clamp(tilt_vel, -MAX_STEP, MAX_STEP))
+
+            if time.time() - last_send > SEND_INTERVAL:
+                send_serial(ser, pan_state, tilt_state)
+                last_send = time.time()
+
+        cv2.putText(frame,
+            f"Colour:{current_colour.upper()}  PAN:{pan_state:+.2f} TILT:{tilt_state:+.2f}",
+            (10,30), cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,255,255),2)
+
+        cv2.imshow("FINAL SYSTEM", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('e'):
+            sending = not sending
+            pan_state = tilt_state = 0.0
+            kalman_ready = False
+            send_serial(ser, 0.0, 0.0)
+        elif key == ord('1'):
+            current_colour = "red"; kalman_ready = False
+        elif key == ord('2'):
+            current_colour = "green"; kalman_ready = False
+        elif key == ord('3'):
+            current_colour = "blue"; kalman_ready = False
+        elif key == ord('4'):
+            current_colour = "yellow"; kalman_ready = False
+
+    send_serial(ser, 0.0, 0.0)
+    cap.release()
+    cv2.destroyAllWindows()
+    if ser:
+        ser.close()
+
+
+if __name__ == "__main__":
+    main()

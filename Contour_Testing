@@ -1,0 +1,125 @@
+"""
+contour_test_compact.py
+Compact version: robust red-contour selection + centroid with temporal smoothing.
+Place next to hsv_values.json and run: python contour_test_compact.py
+Keys: s = save debug image, q = quit
+"""
+
+import cv2, json, os, time
+import numpy as np
+from math import pi, sqrt
+
+# ----- quick config (tune in lab) -----
+HSV_FILE = "hsv_values.json"
+CAM = 1
+W,H = 640,480
+AREA_MIN = 600
+AREA_MAX_RATIO = 0.18   # reject very large objects (bag)
+OPEN_K = (5,5); CLOSE_K = (11,11); CLOSE_IT = 3
+# scoring weights
+W_AREA, W_CIRC, W_ENC, W_SOL, W_ASP, W_TEMP = 0.35, 1.6, 1.3, 1.1, 0.9, 0.4
+SAVE_DIR = "contour_compact_debug"
+# ---------------------------------------
+
+def load_hsv(path):
+    if os.path.exists(path):
+        j = json.load(open(path))
+        low = np.array(j.get("lower",[0,120,60])); high = np.array(j.get("upper",[10,255,255]))
+    else:
+        low, high = np.array([0,120,60]), np.array([10,255,255])
+    # red wrap range
+    low2, high2 = np.array([170,120,60]), np.array([180,255,255])
+    return low, high, low2, high2
+
+def features(c):
+    A = cv2.contourArea(c)
+    P = max(1e-6, cv2.arcLength(c, True))
+    circ = (4*pi*A)/(P*P)
+    (x,y), r = cv2.minEnclosingCircle(c); enc = max(1e-6, pi*r*r)
+    enc_ratio = A/enc
+    hull = cv2.convexHull(c); hullA = max(1e-6, cv2.contourArea(hull))
+    solidity = A/hullA
+    bx,by,bw,bh = cv2.boundingRect(c); aspect = bw/float(bh) if bh>0 else 1.0
+    return {"A":A,"circ":circ,"enc":enc_ratio,"sol":solidity,"aspect":aspect,"cx":int(x),"cy":int(y),"r":int(r)}
+
+def score(feat, prev, diag):
+    area_norm = feat["A"]/(diag*diag)
+    asp_score = max(0.0, 1.0 - abs(1.0 - feat["aspect"]))
+    d = 0.0
+    if prev is not None:
+        d = sqrt((prev[0]-feat["cx"])**2 + (prev[1]-feat["cy"])**2) / diag
+    return (W_AREA*area_norm + W_CIRC*feat["circ"] + W_ENC*feat["enc"]
+            + W_SOL*feat["sol"] + W_ASP*asp_score - W_TEMP*d), d
+
+def ensure(d): 
+    os.makedirs(d, exist_ok=True)
+
+def main():
+    low1, high1, low2, high2 = load_hsv(HSV_FILE)
+    cap = cv2.VideoCapture(CAM); cap.set(cv2.CAP_PROP_FRAME_WIDTH, W); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+    time.sleep(0.15)
+    diag = (W*W + H*H)**0.5; prev = None
+    kern_o = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, OPEN_K)
+    kern_c = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, CLOSE_K)
+    ensure(SAVE_DIR)
+    print("Compact contour tracker — s:save, q:quit")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("No frame, retrying..."); time.sleep(0.05); continue
+        frame = cv2.flip(frame, 1)
+        blur = cv2.GaussianBlur(frame, (7,7), 0)
+        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+        m1 = cv2.inRange(hsv, low1, high1); m2 = cv2.inRange(hsv, low2, high2)
+        mask = cv2.bitwise_or(m1, m2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kern_o, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern_c, iterations=CLOSE_IT)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = sorted(contours, key=cv2.contourArea, reverse=True)[:12]
+        best = None; best_meta = None; best_score = -1e9
+        for c in candidates:
+            feat = features(c)
+            if feat["A"] < AREA_MIN: continue
+            if feat["A"]/(W*H) > AREA_MAX_RATIO: continue
+            sc, dist = score(feat, prev, diag)
+            if sc > best_score:
+                best_score = sc; best = c; best_meta = feat
+
+        disp = frame.copy()
+        mask_show = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        if best is not None:
+            # fill to remove text holes then recompute centroid from moments
+            filled = np.zeros_like(mask); cv2.drawContours(filled, [best], -1, 255, -1)
+            M = cv2.moments(best)
+            if M["m00"] != 0:
+                cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"]); prev = (cx,cy)
+            else:
+                cx, cy = prev if prev else (W//2, H//2)
+            cv2.drawContours(disp, [best], -1, (0,255,0), 2)
+            cv2.circle(disp, (best_meta["cx"], best_meta["cy"]), best_meta["r"], (0,255,0), 2)
+            cv2.circle(disp, (cx, cy), 4, (0,0,255), -1)
+            mask_show = cv2.cvtColor(filled, cv2.COLOR_GRAY2BGR)
+            cv2.putText(disp, f"A:{int(best_meta['A'])} C:{best_meta['circ']:.2f}", (cx+10,cy+10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        else:
+            cv2.putText(disp, "No valid contour", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+
+        # overlays
+        cx_frame, cy_frame = W//2, H//2
+        cv2.line(disp, (cx_frame-10, cy_frame), (cx_frame+10, cy_frame), (255,255,255), 1)
+        cv2.line(disp, (cx_frame, cy_frame-10), (cx_frame, cy_frame+10), (255,255,255), 1)
+
+        vis = cv2.hconcat([cv2.resize(disp, (640,360)), cv2.resize(mask_show, (320,360))])
+        cv2.imshow("Contour Compact (s=save,q=quit)", vis)
+
+        k = cv2.waitKey(1) & 0xFF
+        if k == ord('q'): break
+        if k == ord('s'):
+            fn = os.path.join(SAVE_DIR, f"dbg_{int(time.time())}.jpg")
+            cv2.imwrite(fn, vis); print("Saved", fn)
+
+    cap.release(); cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
