@@ -9,6 +9,13 @@
 
  https://github.com/iram100/Assessment2_PDE4432
 
+ ##  Project Demonstration Video
+
+A full demonstration of the system, including object tracking, multi-colour detection, and eye-colour estimation, is available on YouTube:
+
+https://youtu.be/jcwto2IUrNo?si=BAEI3_4T8D6GkLqJ
+
+
 ## 1. Project Overview
 
 This project implements a **real-time vision-based tracking system** using a camera mounted on a **pan–tilt servo mechanism**. The system detects a coloured object (red cube/ball) using **OpenCV**, estimates its position in the image plane, and generates smooth control commands to align the camera with the object.
