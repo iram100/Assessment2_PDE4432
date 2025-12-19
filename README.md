@@ -13,7 +13,7 @@
 
 A full demonstration of the system, including object tracking, multi-colour detection, and eye-colour estimation, is available on YouTube:
 
-https://youtu.be/jcwto2IUrNo?si=BAEI3_4T8D6GkLqJ
+https://youtu.be/OTWWRsuRx70?si=Xj3jnyYB-KSWy3jf
 
 
 ## 1. Project Overview
